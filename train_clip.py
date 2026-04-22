@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""Train CLIP (ViT-L/14) from scratch using image filenames as text labels."""
+
+import argparse
+import hashlib
+import logging
+import shlex
+import subprocess
+import sys
+from functools import partial
+from pathlib import Path
+
+import commentjson
+import torch
+import torch.nn.functional as F
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoConfig, CLIPModel, CLIPProcessor, get_cosine_schedule_with_warmup
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
+MODEL_ID = "openai/clip-vit-large-patch14"
+
+
+def _run_remote(
+    ssh: str,
+    script: Path,
+    data_dir: Path,
+    config_path: Path,
+    local_output_dir: Path,
+    port: int | None = None,
+    pip_packages: list[str] | None = None,
+) -> None:
+    host, _, rdir = ssh.partition(":")
+    rdir = rdir or "~/train_remote"
+
+    ssh_cmd = ["ssh"] + (["-p", str(port)] if port else [])
+    rsync_opts = ["-avz", "--update"] + (["-e", f"ssh -p {port}"] if port else [])
+
+    pip_install = f" && pip install -q {' '.join(pip_packages)}" if pip_packages else ""
+    setup = f"apt-get update -qq && apt-get install -y rsync{pip_install}"
+    log.info("[remote] Installing dependencies ...")
+    subprocess.run(ssh_cmd + [host, setup], check=True)
+
+    subprocess.run(ssh_cmd + [host, f"mkdir -p {rdir}/data"], check=True)
+    subprocess.run(["rsync"] + rsync_opts + [f"{data_dir}/", f"{host}:{rdir}/data/"], check=True)
+    subprocess.run(["rsync"] + rsync_opts + [str(script), str(config_path), f"{host}:{rdir}/"], check=True)
+
+    remote_args: list[str] = []
+    argv = sys.argv[1:]
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--ssh", "--ssh-port"):
+            i += 2
+            continue
+        try:
+            if Path(a).resolve() == data_dir:
+                remote_args.append("data")
+                i += 1
+                continue
+        except Exception:
+            pass
+        if a == "--config" and i + 1 < len(argv):
+            remote_args += ["--config", "./config.jsonc"]
+            i += 2
+            continue
+        try:
+            if Path(a).resolve() == config_path:
+                remote_args.append("./config.jsonc")
+                i += 1
+                continue
+        except Exception:
+            pass
+        remote_args.append(a)
+        i += 1
+
+    cmd = "cd {} && PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python3 {} {}".format(
+        rdir,
+        shlex.quote(script.name),
+        " ".join(shlex.quote(a) for a in remote_args),
+    )
+    log.info(f"[remote] {cmd}")
+    subprocess.run(ssh_cmd + ["-t", host, cmd], check=True)
+
+    log.info("[remote] Syncing results back ...")
+    local_output_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["rsync"] + rsync_opts + [f"{host}:{rdir}/models_workdir/", f"{local_output_dir}/"], check=True)
+
+    sync_dirs: set[Path] = set()
+    for flag in ("--output",):
+        try:
+            d = Path(remote_args[remote_args.index(flag) + 1]).parent
+            if str(d) != ".":
+                sync_dirs.add(d)
+        except (ValueError, IndexError):
+            pass
+    for d in sync_dirs:
+        d.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["rsync"] + rsync_opts + [f"{host}:{rdir}/{d}/", f"{d}/"], check=True)
+
+    sys.exit(0)
+
+
+def load_config(path: Path) -> dict:
+    with open(path) as f:
+        return commentjson.load(f)
+
+
+class ImageFilenameDataset(Dataset):
+    def __init__(self, data_dir: Path):
+        self.samples = [
+            p for p in data_dir.rglob("*")
+            if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+        ]
+        if not self.samples:
+            raise ValueError(f"No images found in {data_dir}")
+        log.info(f"Found {len(self.samples)} images in {data_dir}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path = self.samples[idx]
+        image = Image.open(path).convert("RGB")
+        return image, path.stem
+
+
+def collate_fn(batch, processor):
+    images, labels = zip(*batch)
+    return processor(
+        text=list(labels),
+        images=list(images),
+        return_tensors="pt",
+        padding="max_length",
+        truncation=True,
+    )
+
+
+def clip_loss(image_embeds, text_embeds, logit_scale):
+    """Symmetric InfoNCE loss used in the original CLIP paper."""
+    img = F.normalize(image_embeds, dim=-1)
+    txt = F.normalize(text_embeds, dim=-1)
+    logits = img @ txt.T * logit_scale.exp()
+    n = logits.shape[0]
+    labels = torch.arange(n, device=logits.device)
+    loss_i = F.cross_entropy(logits, labels)
+    loss_t = F.cross_entropy(logits.T, labels)
+    return (loss_i + loss_t) / 2
+
+
+def get_core(model):
+    return model.module if isinstance(model, torch.nn.DataParallel) else model
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train CLIP from scratch")
+    parser.add_argument("data_dir", type=Path, help="Directory containing training images")
+    parser.add_argument("--config", type=Path, default=Path("config.jsonc"))
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--warmup-steps", type=int, default=1000)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--save-every", type=int, default=1000, help="Steps between periodic checkpoints")
+    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint")
+    parser.add_argument("--output", type=Path, default=None, metavar="PATH/TO/MODEL.json",
+                        help="Path for the output metadata JSON; the .pt is saved alongside it")
+    parser.add_argument("--ssh", type=str, default=None, metavar="[user@]host[:path]",
+                        help="Run on remote GPU: rsync files and execute via SSH")
+    parser.add_argument("--ssh-port", type=int, default=None, metavar="PORT",
+                        help="SSH port for --ssh (default: 22)")
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    DATA_DIR = args.data_dir.resolve()
+    CLIP_MODELS_WORKDIR = Path(cfg["clip_models_dir"]).resolve()
+
+    if args.ssh:
+        _run_remote(
+            args.ssh,
+            Path(__file__).resolve(),
+            DATA_DIR,
+            args.config.resolve(),
+            CLIP_MODELS_WORKDIR,
+            port=args.ssh_port,
+            pip_packages=["commentjson", "transformers", "accelerate"],
+        )
+
+    dir_hash = hashlib.md5(str(DATA_DIR).encode()).hexdigest()[:12]
+    work_dir = CLIP_MODELS_WORKDIR / f"clip_workdir_{dir_hash}"
+
+    CLIP_MODELS_WORKDIR.mkdir(parents=True, exist_ok=True)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    log.info(f"Models dir : {CLIP_MODELS_WORKDIR}")
+    log.info(f"Work dir   : {work_dir}")
+    log.info(f"Data dir   : {DATA_DIR}")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = device.type == "cuda"
+    log.info(f"Device: {device}  AMP: {use_amp}")
+
+    log.info(f"Fetching processor + config for {MODEL_ID} -> {CLIP_MODELS_WORKDIR}")
+    model_config = AutoConfig.from_pretrained(MODEL_ID, cache_dir=CLIP_MODELS_WORKDIR)
+    processor = CLIPProcessor.from_pretrained(MODEL_ID, cache_dir=CLIP_MODELS_WORKDIR)
+
+    log.info("Initializing model with random weights")
+    model = CLIPModel(model_config)
+    model.to(device)
+
+    n_gpus = torch.cuda.device_count()
+    if n_gpus > 1:
+        log.info(f"Using {n_gpus} GPUs via DataParallel")
+        model = torch.nn.DataParallel(model)
+
+    total_params = sum(p.numel() for p in model.parameters()) / 1e9
+    log.info(f"Parameters: {total_params:.2f}B")
+
+    dataset = ImageFilenameDataset(DATA_DIR)
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.workers,
+        collate_fn=partial(collate_fn, processor=processor),
+        pin_memory=use_amp,
+        drop_last=True,
+    )
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    total_steps = args.epochs * len(loader)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=total_steps
+    )
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    start_epoch = 0
+    global_step = 0
+    latest_ckpt = work_dir / "latest_checkpoint.pt"
+
+    if args.resume and latest_ckpt.exists():
+        log.info(f"Resuming from {latest_ckpt}")
+        ckpt = torch.load(latest_ckpt, map_location=device)
+        get_core(model).load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        scaler.load_state_dict(ckpt["scaler"])
+        start_epoch = ckpt["epoch"]
+        global_step = ckpt["global_step"]
+        log.info(f"Resumed at epoch {start_epoch}, step {global_step}")
+
+    def save_checkpoint(epoch, step, named=True):
+        core = get_core(model)
+        state = {
+            "model": core.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "scaler": scaler.state_dict(),
+            "epoch": epoch,
+            "global_step": step,
+        }
+        tmp = latest_ckpt.with_suffix(".tmp")
+        torch.save(state, tmp)
+        tmp.rename(latest_ckpt)
+        if named:
+            named_path = work_dir / f"checkpoint_step{step:08d}.pt"
+            torch.save({"model": core.state_dict(), "epoch": epoch, "global_step": step}, named_path)
+            log.info(f"Checkpoint saved -> {named_path}")
+
+    for epoch in range(start_epoch, args.epochs):
+        model.train()
+        epoch_loss = 0.0
+
+        for batch in loader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                outputs = model(**batch)
+                loss = clip_loss(
+                    outputs.image_embeds,
+                    outputs.text_embeds,
+                    get_core(model).logit_scale,
+                )
+
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+
+            global_step += 1
+            epoch_loss += loss.item()
+
+            if global_step % 100 == 0:
+                lr = scheduler.get_last_lr()[0]
+                log.info(
+                    f"epoch {epoch+1}/{args.epochs}  step {global_step}  "
+                    f"loss={loss.item():.4f}  lr={lr:.2e}"
+                )
+
+            if global_step % args.save_every == 0:
+                save_checkpoint(epoch, global_step)
+
+        avg_loss = epoch_loss / len(loader)
+        log.info(f"Epoch {epoch+1} done — avg loss: {avg_loss:.4f}")
+        save_checkpoint(epoch + 1, global_step, named=False)
+
+    log.info("Training complete.")
+
+    import json as _json
+    json_path = args.output.resolve() if args.output else work_dir / "final_model.json"
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(_json.dumps({"model_id": MODEL_ID}, indent=2))
+    log.info(f"Metadata saved -> {json_path}")
+
+    pt_path = json_path.with_suffix(".pt")
+    torch.save(get_core(model).state_dict(), pt_path)
+    log.info(f"Model saved -> {pt_path}")
+
+
+if __name__ == "__main__":
+    main()

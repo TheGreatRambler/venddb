@@ -1,0 +1,44 @@
+{
+    "clip_models_dir": "./models_workdir",
+    "siglip2_models_dir": "./models_workdir",
+    "convnextv2_models_dir": "./models_workdir",
+    "yolo_models_dir": "./models_workdir",
+    "vending_machine_images_dir": "./images/vending_machine",
+    "vending_machine_output_dir": "./output",
+    "vending_machine_model": "./models/vending_machine.yaml",
+    "japan": {
+        "askul": {
+            "output_dir": "./askul_output",
+            "images_dir": "./images/askul_drink",
+            "model": "./models/askul.yaml",
+            // Sourced from https://www.askul.co.jp/search/
+            "category_url_prefix": [
+                "https://www.askul.co.jp/m/13-1307-1307001", // Soft Water
+                "https://www.askul.co.jp/m/13-1307-1307002", // Hard Water
+                "https://www.askul.co.jp/m/13-1307-1307003", // Sparkling Water
+                "https://www.askul.co.jp/m/13-1307-1307004", // Flavored Water
+                "https://www.askul.co.jp/m/13-1307-1307006", // Other Mineral Water
+                "https://www.askul.co.jp/m/13-1301-1301011", // Japanese Tea / Green Tea
+                "https://www.askul.co.jp/m/13-1301-1301013", // Hojicha
+                "https://www.askul.co.jp/m/13-1301-1301014", // Brown Rice Tea
+                "https://www.askul.co.jp/m/13-1301-1301012", // Barley Tea
+                "https://www.askul.co.jp/m/13-1301-1301016", // Chinese Tea / Oolong Tea
+                "https://www.askul.co.jp/m/13-1301-1301015", // Blended Tea and Grain Tea
+                "https://www.askul.co.jp/m/13-1301-1301017", // Herbal Tea
+                "https://www.askul.co.jp/m/13-1304-1301002", // Coffee
+                "https://www.askul.co.jp/m/13-1304-1301003", // Tea (again)
+                "https://www.askul.co.jp/m/13-1304-1301017", // Herbal Tea
+                "https://www.askul.co.jp/m/13-1304-1301018", // Cocoa and others
+                "https://www.askul.co.jp/m/13-1305-1301019", // Juices / Soft Drinks
+                "https://www.askul.co.jp/m/13-1305-1305002", // Nutritional Drinks
+                "https://www.askul.co.jp/m/13-1310-1310003", // Beer, Soft Drinks, New Genre
+                "https://www.askul.co.jp/m/13-1310-1310005", // Wine
+                "https://www.askul.co.jp/m/13-1310-1310006", // Sake and Shochu
+                "https://www.askul.co.jp/m/13-1310-1310007", // Western liquor
+                "https://www.askul.co.jp/m/13-1310-1310008", // Fruit and Plum Wine
+                "https://www.askul.co.jp/m/13-1310-1310009", // Chuhai Cocktail Highballs
+                "https://www.askul.co.jp/m/13-1310-1310010", // Non-alcoholic beverages
+            ]
+        }
+    }
+}

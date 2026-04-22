@@ -1,1 +1,4 @@
 .vscode
+*.jpg
+models_workdir
+askul_output

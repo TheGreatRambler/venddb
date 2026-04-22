@@ -1,26 +1,43 @@
+#include "venddb_inference.h"
+
 #include <fmt/core.h>
-#include <yolos/yolos.hpp>
 
-int main() {
-	fmt::print("Hello, World! This is a clamped int: {}\n", yolos::utils::clamp(0, 50, 100));
+#include <cstdlib>
+#include <string>
 
-	yolos::det::YOLODetector detector("../yolo26_model/yolo26x.onnx", "coco.yaml", /*gpu=*/true);
-
-	// Detect
-	cv::Mat frame   = cv::imread("/Users/tgr/Downloads/PXL_20260115_033759751.jpg");
-	auto detections = detector.detect(frame, /*conf=*/0.01f, /*iou=*/0.45f);
-
-	// Process results
-	for(const auto& det : detections) {
-		fmt::print("Confidence: {} Box X,Y,Width,Height: {},{},{},{}\n", det.conf, det.box.x, det.box.y, det.box.width,
-			det.box.height);
+int main(int argc, char* argv[]) {
+	if(argc < 3) {
+		fmt::print(stderr, "Usage: {} <config.yaml> <image.jpg>\n", argv[0]);
+		return 1;
 	}
 
-	// Visualize
-	// cv::Mat white = cv::Mat::ones(frame.size(), frame.type()) * 255;
-	// cv::addWeighted(frame, 0.7, white, 0.3, 0, frame);
-	detector.drawDetectionsWithMask(frame, detections);
-	cv::imwrite("output.png", frame);
+	const char* configPath = argv[1];
+	const char* imagePath  = argv[2];
 
+	VendDB_Detector det = venddb_load_detector(configPath, /*use_gpu=*/0);
+	if(!det) {
+		fmt::print(stderr, "Failed to load detector: {}\n", venddb_last_error());
+		return 1;
+	}
+
+	int count              = 0;
+	VendDB_Detection* dets = venddb_detect_file(det, imagePath, -1.f, -1.f, &count);
+	if(!dets && count == 0) {
+		const char* err = venddb_last_error();
+		if(err && err[0] != '\0') {
+			fmt::print(stderr, "Detection failed: {}\n", err);
+			venddb_destroy_detector(det);
+			return 1;
+		}
+	}
+
+	fmt::print("{} detections in {}\n", count, imagePath);
+	for(int i = 0; i < count; ++i) {
+		fmt::print("  [{}] class={} conf={:.3f} box=({},{},{},{})\n", i, dets[i].class_name, dets[i].confidence,
+			dets[i].x, dets[i].y, dets[i].width, dets[i].height);
+	}
+
+	venddb_free_detections(dets);
+	venddb_destroy_detector(det);
 	return 0;
 }
