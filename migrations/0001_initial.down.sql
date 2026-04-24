@@ -1,0 +1,3 @@
+DROP TABLE IF EXISTS drink;
+DROP TABLE IF EXISTS drink_image;
+DROP TABLE IF EXISTS source;

@@ -1,29 +1,15 @@
 package vend
 
 import (
-	"compress/gzip"
-	"compress/zlib"
-	"context"
-	"crypto/tls"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
-	"net"
-	"net/http"
-	"os"
-	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
-	"github.com/andybalholm/brotli"
 	"github.com/davidbyttow/govips/v2/vips"
-	"github.com/klauspost/compress/zstd"
-	utls "github.com/refraction-networking/utls"
-	"golang.org/x/net/http2"
+	"github.com/imroc/req/v3"
 )
 
 /*
@@ -200,147 +186,15 @@ func (s *VendServer) ScrapeCocaColaDrinks() ([]CocaColaBrand, []CocaColaDrink, e
 }
 */
 
-type AskulDrink struct {
-	Brand string `json:"brand"`
+// https://www.useragentstring.com/pages/Chrome/ for version 120
+var askulClient = req.NewClient().
+	ImpersonateChrome().
+	SetUserAgent("Mozilla/5.0 (Windows Server 2012 R2 Standard; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.5975.80 Safari/537.36")
 
-	VarCode string `json:"var_code"` // Variation code
-	VarName string `json:"var_name"` // Variation name
-
-	Code string `json:"code"` // Product code
-	Name string `json:"name"`
-
-	Description string `json:"description"`
-	//ServingSize     string            `json:"serving_size"`
-	//Ingredients     []string          `json:"ingredients"`
-	//Allergens       []string          `json:"allergens"`
-	//NutritionalInfo map[string]string `json:"nutritional_info"`
-}
-
-func decompressResponse(res *http.Response) error {
-	encoding := res.Header.Get("Content-Encoding")
-	var body io.ReadCloser
-	var err error
-	switch encoding {
-	case "gzip":
-		body, err = gzip.NewReader(res.Body)
-		if err != nil {
-			return err
-		}
-	case "deflate":
-		body, err = zlib.NewReader(res.Body)
-		if err != nil {
-			return err
-		}
-	case "br":
-		body = io.NopCloser(brotli.NewReader(res.Body))
-	case "zstd":
-		r, err := zstd.NewReader(res.Body)
-		if err != nil {
-			return err
-		}
-		body = r.IOReadCloser()
-	default:
-		return nil
-	}
-	res.Body = body
-	res.Header.Del("Content-Encoding")
-	res.ContentLength = -1
-	return nil
-}
-
-type userAgentProfile struct {
-	user_agent string
-	hello_id   utls.ClientHelloID
-}
-
-func AskulGET(url string) (*http.Response, error) {
-	USER_AGENTS := []userAgentProfile{
-		// Returned 403s for me. Potentially banned.
-		//{"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.6723.191 Safari/537.36", utls.HelloChrome_Auto},
-		//{"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.5735.196 Safari/537.36", utls.HelloChrome_Auto},
-		{"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/80.0.3987.149 Safari/537.36", utls.HelloChrome_Auto},
-		{"Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/84.0.4147.105 Safari/537.36", utls.HelloChrome_Auto},
-		{"Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/72.0.3626.121 Safari/537.36", utls.HelloChrome_Auto},
-	}
-
-	profile := USER_AGENTS[rand.Intn(len(USER_AGENTS))]
-
-	// Using http2 for compatability with Askul.
-	transport := &http2.Transport{
-		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-			conn, err := net.Dial(network, addr)
-			if err != nil {
-				return nil, err
-			}
-
-			host, _, err := net.SplitHostPort(addr)
-			if err != nil {
-				conn.Close()
-				return nil, err
-			}
-
-			tls_conn := utls.UClient(conn, &utls.Config{
-				ServerName: host,
-			}, profile.hello_id)
-
-			if err := tls_conn.HandshakeContext(ctx); err != nil {
-				tls_conn.Close()
-				return nil, err
-			}
-
-			return tls_conn, nil
-		},
-	}
-
-	client := &http.Client{
-		Transport: transport,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			// Don't follow redirects, since this indicates the page isn't valid.
-			return http.ErrUseLastResponse
-		},
-	}
-
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("User-Agent", profile.user_agent)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
-	req.Header.Set("Referer", "https://www.askul.co.jp")
-	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("Upgrade-Insecure-Requests", "1")
-	req.Header.Set("Sec-Fetch-Dest", "document")
-	req.Header.Set("Sec-Fetch-Mode", "navigate")
-	req.Header.Set("Sec-Fetch-Site", "same-origin")
-	req.Header.Set("Sec-Fetch-User", "?1")
-	req.Header.Set("Priority", "u=0, i")
-	req.Header.Set("TE", "trailers")
-
-	res, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	if err := decompressResponse(res); err != nil {
-		res.Body.Close()
-		return nil, err
-	}
-	return res, nil
-}
-
-func ScrapeAskulDrinks(category_prefix_urls []string) ([]AskulDrink, error) {
-	//const PARAMETER_STR = "?resultType=0&sortDir=1&resultCount=100&" +
-	//	"searchKeyList=000343_パッケージの種類_10500_缶" + // Can
-	//	"&searchKeyList=000343_パッケージの種類_10600_カップ" + // Cup
-	//	"&searchKeyList=000343_パッケージの種類_10100_ペットボトル" + // "PET Bottle"
-	//	"&searchKeyList=000343_パッケージの種類_10200_瓶" + // Bottle
-	//	"&searchKeyList=000343_パッケージの種類_10300_パック" // Pack (Juicebox basically)
-
+func ScrapeAskulDrinks(category_prefix_urls []string) ([]VendDrink, error) {
 	const PARAMETER_STR = "?resultType=0&sortDir=1&resultCount=100"
 
-	drinks := []AskulDrink{}
+	var drinks []VendDrink
 
 	for _, category_prefix_url := range category_prefix_urls {
 		page := 1
@@ -348,9 +202,13 @@ func ScrapeAskulDrinks(category_prefix_urls []string) ([]AskulDrink, error) {
 			// Wait to prevent an IP ban.
 			time.Sleep(time.Second)
 
-			// Request this page.
+			// Disallow redirects while scraping (indicates a non existent page).
 			url := fmt.Sprintf("%s-%d/%s", category_prefix_url, page, PARAMETER_STR)
-			res, err := AskulGET(url)
+			res, err := askulClient.
+				SetRedirectPolicy(req.NoRedirectPolicy()).
+				R().
+				SetHeader("Referer", "https://www.askul.co.jp").
+				Get(url)
 			if err != nil {
 				return nil, err
 			}
@@ -359,15 +217,13 @@ func ScrapeAskulDrinks(category_prefix_urls []string) ([]AskulDrink, error) {
 
 			if res.StatusCode == 302 {
 				// This page does not exist, so we have reached the end.
-				// This is intended as a redirect to the first page.
 				break
 			}
 
 			if res.StatusCode != 200 {
-				return nil, fmt.Errorf("Askul drinks website status code error: %d %s", res.StatusCode, res.Status)
+				return nil, fmt.Errorf("Askul drinks website status code error: %d %s from %s", res.StatusCode, res.Status, url)
 			}
 
-			// Load the HTML document of this page.
 			page_doc, err := goquery.NewDocumentFromReader(res.Body)
 			if err != nil {
 				return nil, err
@@ -380,156 +236,130 @@ func ScrapeAskulDrinks(category_prefix_urls []string) ([]AskulDrink, error) {
 				variation_items := s.Find(".m-thumbnailimages_item")
 
 				if variation_items.Length() == 0 {
-					// Only one product for this item.
 					drink_code, _ := s.Find("[data-catalog-item-code]").Attr("data-catalog-item-code")
-					drink := AskulDrink{
-						Brand: "", // TODO
-
-						Code: drink_code,
-						Name: name,
-
-						Description: description,
-					}
-
-					drinks = append(drinks, drink)
-					num_items_on_page += 1
+					drinks = append(drinks, VendDrink{
+						Source: "askul",
+						Code:   drink_code,
+						ExtraJSON: map[string]any{
+							"name":        name,
+							"description": description,
+						},
+					})
+					num_items_on_page++
 				} else {
 					var_code, _ := s.Find("[data-variation-code]").Attr("data-variation-code")
 
 					variation_items.Each(func(_ int, v *goquery.Selection) {
-						// Process each variation item
 						drink_code_raw, _ := v.Find(".a-link").Attr("href")
 						drink_code, _ := strings.CutPrefix(drink_code_raw, "/p/")
 						drink_code, _ = strings.CutSuffix(drink_code, "/")
-
 						drink_name, _ := v.Find(".a-tooltip_content .a-img_img").Attr("alt")
 
-						drink := AskulDrink{
-							Brand: "", // TODO
-
-							VarCode: var_code,
-							VarName: name,
-
-							Code: drink_code,
-							Name: drink_name,
-
-							Description: description,
-						}
-
-						drinks = append(drinks, drink)
-						num_items_on_page += 1
+						drinks = append(drinks, VendDrink{
+							Source: "askul",
+							Code:   drink_code,
+							ExtraJSON: map[string]any{
+								"var_code":    var_code,
+								"var_name":    name,
+								"name":        drink_name,
+								"description": description,
+							},
+						})
+						num_items_on_page++
 					})
 				}
 			})
 
-			//fmt.Printf("Page: %d Count: %d\n URL: %s\n", page, num_items_on_page, url)
-
-			page += 1
+			page++
+			_ = num_items_on_page
 		}
 	}
 
 	return drinks, nil
 }
 
-const askulImageURLPattern = "https://cdn.askul.co.jp/img/product/3L1/%s_3L1.jpg"
+const ASKUL_IMAGE_URL = "https://cdn.askul.co.jp/img/product/3L1/%s_3L1.jpg"
 
-func ExportAskulDrinks(askul_model string, drinks []AskulDrink, askul_output string) error {
-	if err := os.MkdirAll(askul_output, 0755); err != nil {
-		return fmt.Errorf("creating %s: %w", askul_output, err)
-	}
+// VendDrink is a normalised drink record from any source.
+type VendDrink struct {
+	Source    string
+	Code      string
+	ExtraJSON map[string]any
+}
 
-	detector, err := LoadYOLODetector(askul_model, false)
+// VendDrinkExport holds the processed output for a single drink.
+type VendDrinkExport struct {
+	Image []byte
+}
+
+// ExportAskulDrink downloads the Askul CDN image for drink, runs YOLO detection,
+// crops to the best bounding box, and returns a VendDrinkExport.
+func ExportAskulDrink(detector *YOLODetector, drink VendDrink) (VendDrinkExport, bool, error) {
+	// Do not allow for redirects, as that just redirects to the noimage default.
+	img_url := fmt.Sprintf(ASKUL_IMAGE_URL, drink.Code)
+	res, err := askulClient.
+		SetRedirectPolicy(req.NoRedirectPolicy()).
+		R().
+		SetHeader("Referer", "https://www.askul.co.jp").
+		Get(img_url)
 	if err != nil {
-		return fmt.Errorf("loading YOLO detector: %w", err)
+		return VendDrinkExport{}, false, fmt.Errorf("download: %w", err)
 	}
-	defer detector.Close()
-
-	total := len(drinks)
-	for i, drink := range drinks {
-		log.Printf("ExportAskulDrinks: [%d/%d] %s", i+1, total, drink.Code)
-
-		out_path := filepath.Join(askul_output, drink.Code+".webp")
-		if _, err := os.Stat(out_path); err == nil {
-			continue // already processed
-		}
-
-		time.Sleep(300 * time.Millisecond)
-
-		img_url := fmt.Sprintf(askulImageURLPattern, drink.Code)
-		res, err := AskulGET(img_url)
-		if err != nil {
-			log.Printf("ExportAskulDrinks: %s: download: %v", drink.Code, err)
-			continue
-		}
-		img_data, read_err := io.ReadAll(res.Body)
-		res.Body.Close()
-		if read_err != nil {
-			log.Printf("ExportAskulDrinks: %s: read body: %v", drink.Code, read_err)
-			continue
-		}
-		if res.StatusCode != 200 {
-			log.Printf("ExportAskulDrinks: %s: HTTP %d", drink.Code, res.StatusCode)
-			continue
-		}
-
-		// 80% confidence.
-		dets, err := detector.DetectBytes(img_data, 0.80, -1)
-		if err != nil {
-			log.Printf("ExportAskulDrinks: %s: inference: %v", drink.Code, err)
-			continue
-		}
-
-		// Get the best singular "drink" detection.
-		var drink_dets []Detection
-		for _, d := range dets {
-			if d.Class == "drink" {
-				drink_dets = append(drink_dets, d)
-			}
-		}
-		if len(drink_dets) == 0 {
-			log.Printf("ExportAskulDrinks: %s: no drink detected (%d total)", drink.Code, len(dets))
-			continue
-		}
-		sort.Slice(drink_dets, func(i, j int) bool {
-			return drink_dets[i].Confidence > drink_dets[j].Confidence
-		})
-		best := drink_dets[0]
-
-		vips_img, err := vipsCropToDetection(img_data, best)
-		if err != nil {
-			log.Printf("ExportAskulDrinks: %s: crop: %v", drink.Code, err)
-			continue
-		}
-
-		ep := vips.NewWebpExportParams()
-		ep.Lossless = true
-		webp_data, _, err := vips_img.ExportWebp(ep)
-		vips_img.Close()
-		if err != nil {
-			log.Printf("ExportAskulDrinks: %s: webp encode: %v", drink.Code, err)
-			continue
-		}
-
-		if err := os.WriteFile(out_path, webp_data, 0644); err != nil {
-			log.Printf("ExportAskulDrinks: %s: save: %v", drink.Code, err)
-			continue
-		}
-
-		// Output JSON metadata for this drink as well.
-		json_data, err := json.Marshal(drink)
-		if err != nil {
-			log.Printf("ExportAskulDrinks: %s: json marshal: %v", drink.Code, err)
-			continue
-		}
-		json_path := filepath.Join(askul_output, drink.Code+".json")
-		if err := os.WriteFile(json_path, json_data, 0644); err != nil {
-			log.Printf("ExportAskulDrinks: %s: json save: %v", drink.Code, err)
-			continue
-		}
-
-		log.Printf("ExportAskulDrinks: saved %s (conf=%.2f, %dx%d px)",
-			out_path, best.Confidence, best.Width, best.Height)
+	img_data, err := io.ReadAll(res.Body)
+	res.Body.Close()
+	if err != nil {
+		return VendDrinkExport{}, false, fmt.Errorf("read body: %w", err)
 	}
 
-	return nil
+	// A redirect is just to `noimage`, which indicates the drink might not exist anymore.
+	// Basically the way 404s are represented by this service.
+	// TODO use a different flag than `not_a_drink` to indicate this.`
+	if res.StatusCode == 302 {
+		return VendDrinkExport{}, true, fmt.Errorf("redirect to noimage")
+	}
+
+	if res.StatusCode != 200 {
+		return VendDrinkExport{}, false, fmt.Errorf("HTTP %d", res.StatusCode)
+	}
+
+	dets, err := detector.DetectBytes(img_data, 0.90, -1)
+	if err != nil {
+		return VendDrinkExport{}, false, fmt.Errorf("inference: %w", err)
+	}
+
+	var drink_dets []Detection
+	for _, d := range dets {
+		if d.Class == "drink" {
+			drink_dets = append(drink_dets, d)
+		}
+	}
+	if len(drink_dets) == 0 {
+		return VendDrinkExport{}, true, fmt.Errorf("no drink detected (%d total detections)", len(dets))
+	}
+
+	// Get the best singular drink detection.
+	var best Detection
+	var best_confidence = float32(0.0)
+	for _, drink_det := range drink_dets {
+		if drink_det.Confidence > best_confidence {
+			best = drink_det
+			best_confidence = drink_det.Confidence
+		}
+	}
+
+	vips_img, err := vipsCropToDetection(img_data, best)
+	if err != nil {
+		return VendDrinkExport{}, false, fmt.Errorf("crop: %w", err)
+	}
+
+	ep := vips.NewWebpExportParams()
+	ep.Lossless = true
+	webp_data, _, err := vips_img.ExportWebp(ep)
+	vips_img.Close()
+	if err != nil {
+		return VendDrinkExport{}, false, fmt.Errorf("webp encode: %w", err)
+	}
+
+	log.Printf("ExportAskulDrink: %s conf=%.2f %dx%d px %vkb", drink.Code, best.Confidence, best.Width, best.Height, len(webp_data)/1024)
+	return VendDrinkExport{Image: webp_data}, true, nil
 }

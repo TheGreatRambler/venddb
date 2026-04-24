@@ -1,0 +1,7 @@
+flask
+gunicorn
+transformers
+accelerate
+Pillow
+commentjson
+numpy

@@ -2,3 +2,5 @@
 *.jpg
 models_workdir
 askul_output
+models
+volumes

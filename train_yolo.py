@@ -181,7 +181,7 @@ DATASET_DIR = WORK_DIR / "dataset"
 MODEL_PATH = (
     WORK_DIR / args.model
 )  # n / s / m / l / x. Must be one of the valid sizes, as well as a path
-EPOCHS = 100
+EPOCHS = 300
 IMG_SIZE = 640
 BATCH = 8
 VAL_SPLIT = 0.15  # fraction of images held out for validation

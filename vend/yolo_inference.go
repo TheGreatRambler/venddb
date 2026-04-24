@@ -1,10 +1,9 @@
 package vend
 
 /*
-#cgo CFLAGS:  -I${SRCDIR}/../inference/include
-#cgo LDFLAGS: -L${SRCDIR}/../inference/build -lvenddb_inference
-#cgo LDFLAGS: -Wl,-rpath,${SRCDIR}/../inference/build
-#cgo pkg-config: libonnxruntime opencv4
+#cgo CFLAGS:  -I${SRCDIR}/../inference_native/include
+#cgo LDFLAGS: -L${SRCDIR}/../inference_native/build -lvenddb_inference
+#cgo LDFLAGS: -Wl,-rpath,${SRCDIR}/../inference_native/build
 #include "venddb_inference.h"
 #include <stdlib.h>
 */

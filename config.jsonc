@@ -6,6 +6,12 @@
     "vending_machine_images_dir": "./images/vending_machine",
     "vending_machine_output_dir": "./output",
     "vending_machine_model": "./models/vending_machine.yaml",
+    "scrape_refresh_days": 7,
+    "postgres_port": 7843,
+    "milvus_port": 19530,
+    "embed_service_port": 5936,
+    "export_workers": 4,
+    "embed_workers": 4,
     "japan": {
         "askul": {
             "output_dir": "./askul_output",
